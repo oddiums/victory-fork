@@ -155,7 +155,9 @@ const WINDOW_MOST: u64 = 64;
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
-/// their record there with no pass of ours, until one of these: a compute
+/// their record there with no pass of ours and no barrier (the scratch
+/// buffer stays readable as arguments until the next clamp), until one of
+/// these: a compute
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
@@ -179,9 +181,14 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+///
+/// On by default since the indirect clamp charges its budget once per
+/// group in the card's memory (#220): in the world on an RTX 4090, 159 ms a
+/// frame without windows, 117-126 ms with them (the card's waits 68 -> 26
+/// ms). `VICTORY_INDIRECT_WINDOW=0` clamps record by record, as before.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -549,10 +556,27 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // As table constant buffers (#522): bytes a flight in the air may
+    // write are copied from the host copy on the card, behind the flight,
+    // instead of filled from title memory at submission, which waits for
+    // the flight to land (`VICTORY_FILL_ON_CARD=0` fills as before).
+    if crate::host::fill_on_card()
+        && crate::host::late()
+        && crate::host::flights_write(address as usize, (address + len) as usize)
+    {
+        shadow.refresh(list, address, len);
+        if let Some(gpu) = list.card_constants(&shadow, address, len) {
+            ROOT_ON_CARD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(gpu);
+        }
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
 }
+
+/// Root constant buffers filled on the card behind flights ([`root_view`]).
+pub(crate) static ROOT_ON_CARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -2677,7 +2701,8 @@ impl State {
                 let source = (&bounded, u64::from(record) * u64::from(stride));
                 ran &= self.emulate_mesh(list, p, Some((source, count_arg, record)), 0);
             }
-            crate::indirect::done(list, &bounded);
+            // Mesh argument preparation restores INDIRECT_ARGUMENT; leave
+            // the scratch readable until the next clamp, as upstream does.
             if ran { DRAWN.fetch_add(1, Ordering::Relaxed); }
             return ran;
         }
@@ -2778,7 +2803,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -2813,7 +2837,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // The scratch buffer stays readable as arguments: the next draw of
+        // the window reads it with no barrier, and the next clamp moves it
+        // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

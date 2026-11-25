@@ -17,6 +17,8 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
+    // Our benchmark-analysis source; all content checks below still apply.
+    "analyze-frametime.py",
     ".gitignore",
     ".gitattributes",
     ".editorconfig",
