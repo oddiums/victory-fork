@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    mesh_fallback: OnceLock<Option<victory_shader::emit::MeshFallback>>,
+    #[cfg(windows)]
+    bary_fallback: OnceLock<Option<Arc<Shader>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -113,6 +117,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                mesh_fallback: OnceLock::new(),
+                #[cfg(windows)]
+                bary_fallback: OnceLock::new(),
             })
         })
         .clone()
@@ -134,6 +142,8 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         translated: OnceLock::new(),
+        mesh_fallback: OnceLock::new(),
+        bary_fallback: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -152,6 +162,36 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    fn replacement(stage: &'static str, host: victory_shader::emit::HostShader, used: Vec<victory_shader::UsedResource>, stores: bool) -> Arc<Self> {
+        let hash = blake3::hash(&host.dxil).to_hex()[..16].to_owned();
+        Arc::new(Self { stage, hash, container: Vec::new(),
+            translated: OnceLock::from(Some(Translated { host, used, stores })),
+            mesh_fallback: OnceLock::new(), bary_fallback: OnceLock::new() })
+    }
+
+    fn bary_fallback(&self) -> Option<Arc<Self>> {
+        self.bary_fallback.get_or_init(|| {
+            use victory_shader::dxbc::{Container, FourCC};
+            let t = self.translated()?;
+            let c = Container::parse(&t.host.dxil).ok()?;
+            let features = c.part(FourCC::SFI0)?.data;
+            let bits = u64::from_le_bytes(features.get(..8)?.try_into().ok()?);
+            if bits & 0x2_0000 == 0 { return None; }
+            match victory_shader::emit::translate_bary_fallback(&self.container) {
+                Ok(host) => Some(Self::replacement("pixel", host, t.used.clone(), t.stores)),
+                Err(error) => { tracing::warn!(%error, hash = %self.hash, "pixel barycentric fallback did not translate"); None }
+            }
+        }).clone()
+    }
+
+    fn mesh_fallback(&self) -> Option<&victory_shader::emit::MeshFallback> {
+        self.mesh_fallback.get_or_init(|| {
+            match victory_shader::emit::translate_mesh_fallback(&self.container) {
+                Ok(fallback) => Some(fallback),
+                Err(error) => { tracing::warn!(%error, hash = %self.hash, "mesh compute fallback did not translate"); None }
+            }
+        }).as_ref()
+    }
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {

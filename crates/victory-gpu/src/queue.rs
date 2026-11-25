@@ -585,12 +585,17 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// PresentX plane ABI (72 bytes). The rectangle arrays have one entry per
+/// resource. Keep the trailing presentation options even though the SDR
+/// compositor does not yet interpret them: they determine the array stride.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rects: *const [i32; 4],
+    destination_rects: *const [f32; 4],
+    options: [u64; 4],
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -745,15 +750,11 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Presents the title's display planes, including its separate UI plane.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -813,6 +814,32 @@ extern "system" fn present(
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }
+    }
+    #[cfg(windows)]
+    if planes > 1 && !plane_parameters.is_null() {
+        // SAFETY: the title supplies `planes` complete plane descriptions.
+        let descriptions = unsafe { std::slice::from_raw_parts(plane_parameters, planes as usize) };
+        let mut layers = Vec::new();
+        for plane in descriptions {
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // shortcut: stereo/multi-view resources within a plane still use
+            // the first view, as the single-plane path does.
+            let resource = unsafe { *plane.resources };
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                layers.push(crate::present::Layer {
+                    texture: copy.texture.clone(),
+                    state: copy.state.load(Ordering::Relaxed),
+                    source: unsafe { plane.source_rects.as_ref().copied() },
+                    destination: unsafe { plane.destination_rects.as_ref().copied() },
+                });
+            }
+        }
+        if let Err(error) = crate::present::show(&layers, frame) {
+            tracing::warn!(%error, "could not compose presentation planes");
+        }
+        return S_OK;
     }
     #[cfg(windows)]
     if planes > 0
@@ -1004,6 +1031,13 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn presentation_planes_keep_the_full_array_stride() {
+        assert_eq!(size_of::<Plane>(), 72);
+        assert_eq!(std::mem::offset_of!(Plane, source_rects), 24);
+        assert_eq!(std::mem::offset_of!(Plane, destination_rects), 32);
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

@@ -89,6 +89,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod bary_fallback;
+mod mesh_fallback;
 mod own_bits;
 mod rect;
 mod sampler;
@@ -112,6 +114,8 @@ pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
+pub use bary_fallback::{translate_bary_fallback, barycentric_gs};
+pub use mesh_fallback::{MeshFallback, MeshLayout, SLOT_MESH_OUTPUT, SLOT_MESH_TRIANGLES, translate_mesh_fallback, mesh_fallback_vertex, mesh_fallback_vertex_compact};
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
@@ -1715,6 +1719,43 @@ mod barycentric_tests {
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
+    }
+
+    #[test]
+    fn barycentric_fallback_uses_regular_interpolants() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [0x1006_00F0, 0xC808_0003, 0xC809_0001, e0, e1, S_ENDPGM];
+        let shader = super::bary_fallback::with_fallback(|| pixel(&words, PERSP_CENTER)).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0);
+        assert!(inputs.iter().all(|e| e.kind != 28));
+        assert!(inputs.iter().any(|e| e.name == "VICTORY_BARY"));
+        assert!(inputs.iter().any(|e| e.name == "VICTORY_VERTEX"));
+        validate(&shader);
+        #[cfg(windows)] {
+            use super::shader::Shader;
+            use super::bitcode::{Attr, Term};
+            let mut vs = Shader::new(false);
+            let mut texcoord = element("TEXCOORD", 0, 0); texcoord.interp = 2; texcoord.usage = 15;
+            let mut position = element("SV_Position", 3, 1); position.interp = 4; position.usage = 15;
+            vs.outputs = vec![texcoord, position];
+            let b = vs.entry;
+            for id in 0..2u32 { for col in 0..4u8 {
+                let args = [vs.m.i32(id),vs.m.i32(0),vs.m.i8(col),vs.m.f32(1.0f32.to_bits())];
+                vs.op(b,"storeOutput.f32",Attr::NoUnwind,vs.t.void,5,&args);
+            } }
+            vs.m.terminate(b,Term::Ret);
+            let vertex = vs.finish();
+            let gs = super::barycentric_gs(&vertex, &shader.dxil).unwrap().unwrap();
+            if let Ok(mut validator) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+                validator.validate(&mut gs.clone()).unwrap();
+            }
+            if let Ok(host) = super::host::Host::new(false) {
+                let vs = HostShader {stage:HwStage::Vs,dxil:vertex,..shader.clone()};
+                let root = host.root_signature(&vs,&shader).unwrap();
+                host.pipeline_with_gs(&root,&vs.dxil,Some(&gs),&shader.dxil).unwrap();
+            }
+        }
     }
 
     /// Weights from constants alone: the vertices, no `SV_Barycentrics`.

@@ -382,7 +382,7 @@ pub(crate) fn dump_targets(frame: u64) {
     }
 }
 
-fn dump_one(
+pub(crate) fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     state: u32,

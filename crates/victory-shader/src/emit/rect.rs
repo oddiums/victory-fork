@@ -125,6 +125,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         ));
     }
     s.outputs = outputs;
+    let extras = super::bary_fallback::augment(&mut s, ps_inputs)?;
     let b = s.entry;
 
     // Every input of the three vertices: [element][column][vertex].
@@ -210,6 +211,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         number = Some((id, n));
     }
     let stream = s.m.i8(0);
+    let extra_values: Vec<Vec<Vec<V>>> = emitted.iter().map(|e| e.iter().map(|v| v.to_vec()).collect()).collect();
     for vertex in 0..VERTICES as usize {
         for (id, columns) in emitted.iter().enumerate() {
             let name = if s.outputs[id].comp == 9 {
@@ -231,6 +233,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
             let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(0), n];
             s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
         }
+        super::bary_fallback::emit_extras(&mut s, &extras, &extra_values, vertex);
         s.op(b, "emitStream", Attr::NoUnwind, s.t.void, 97, &[stream]);
         // The strip ends after the first triangle.
         if vertex == 2 {

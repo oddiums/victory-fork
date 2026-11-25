@@ -23,7 +23,7 @@ walkdir.workspace = true
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
-# the host debug layer, scripted keys). Off in a plain release build.
+# the host debug layer). Off in a plain release build.
 diagnostics = [
     "victory-core/diagnostics",
     "victory-hle/diagnostics",

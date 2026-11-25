@@ -142,7 +142,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -2166,6 +2166,14 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(windows)]
+pub(crate) fn owns(this: This) -> bool {
+    let mut bytes = [0; 8];
+    crate::host::read_into(this.cast(), &mut bytes)
+        && [LIST_FUNCTIONS.0.as_ptr() as usize, NEWER_LIST_FUNCTIONS.0.as_ptr() as usize]
+            .contains(&usize::from_ne_bytes(bytes))
+}
 
 #[cfg(test)]
 mod tests {

@@ -413,21 +413,46 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+// Worker controls adapted from skornuta/victory-fork (GPL-3.0-or-later).
+/// How many pipeline workers run: half the logical processors, 2 to 8, unless
+/// `VICTORY_PIPELINE_WORKERS` names a count (1 to 64). The default leaves most
+/// of a large CPU idle while a world load waits for pipelines.
+fn worker_count(logical: Option<usize>, over: Option<&str>) -> usize {
+    if let Some(n) = over.and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(1, 64);
+    }
+    logical.map_or(2, |n| (n / 2).clamp(2, 8))
+}
+
+/// `VICTORY_PIPELINE_PRIORITY=normal`: the workers run at normal priority
+/// instead of below the title's own threads.
+fn workers_below_normal() -> bool {
+    std::env::var("VICTORY_PIPELINE_PRIORITY").map_or(true, |v| v.trim() != "normal")
+}
+
+/// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count(
+            std::thread::available_parallelism().ok().map(|n| n.get()),
+            std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref(),
+        );
+        let below = workers_below_normal();
+        tracing::info!(workers, below_normal = below, "pipeline workers (VICTORY_PIPELINE_WORKERS, VICTORY_PIPELINE_PRIORITY)");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
+                .spawn(move || {
+                    // Below the title's own threads (loading, recording),
+                    // unless asked for normal priority.
                     // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    if below {
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
                     }
                     loop {
                         next().make();

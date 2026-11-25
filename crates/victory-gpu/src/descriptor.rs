@@ -353,7 +353,7 @@ struct Views {
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -522,8 +522,17 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(shape) = views.shape(shape) {
+                    let known = VIEWS.read().unwrap_or_else(|e| e.into_inner())
+                        .shape_index
+                        .get(&shape)
+                        .copied();
+                    let shape = known.or_else(|| {
+                        VIEWS
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .shape(shape)
+                    });
+                    if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
                     }
@@ -532,7 +541,16 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+    // Most frame-local descriptors reuse a known view. Readers can look
+    // up those immutable records concurrently with one another.
+    let known = {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        views
+            .index
+            .get(&view)
+            .map(|&i| [i, views.list[i as usize].1])
+    };
+    known.unwrap_or_else(|| VIEWS.write().unwrap_or_else(|e| e.into_inner()).entry(view))
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -546,7 +564,7 @@ fn words_for(view: View) -> [u32; 2] {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -697,7 +715,7 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -722,12 +740,12 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => VIEWS.lock().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
+        PLACED => VIEWS.read().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
         _ => None,
     }
 }
@@ -1104,8 +1122,12 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-        let entries = || VIEWS.lock().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.lock().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let entries = || {
+            VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count()
+        };
+        let shapes = || {
+            VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count()
+        };
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);

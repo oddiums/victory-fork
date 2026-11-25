@@ -15,6 +15,8 @@ pub mod d3d12x;
 pub mod display;
 pub mod dsp;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
 pub mod files;

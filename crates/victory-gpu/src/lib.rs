@@ -28,6 +28,8 @@ pub mod dxgi;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
+pub mod frametime;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -38,6 +40,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod present;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -48,6 +52,13 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+#[cfg(windows)]
+mod mesh_fallback;
+#[cfg(windows)]
+mod spatial;
+#[cfg(windows)]
+pub use spatial::try_spatial_upscale;
+#[cfg(windows)]
 #[cfg(windows)]
 mod shadow;
 pub mod signature;

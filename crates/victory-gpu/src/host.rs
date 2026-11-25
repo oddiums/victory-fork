@@ -76,6 +76,28 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub(crate) fn adapter_summary() -> Option<(String, u64)> {
+    let host = host()?;
+    let adapter = host.adapter.as_ref()?;
+    // SAFETY: a plain DXGI adapter query on an adapter the device named.
+    let desc = unsafe {
+        adapter
+            .cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>()
+            .ok()?
+            .GetDesc1()
+            .ok()?
+    };
+    let end = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    Some((
+        String::from_utf16_lossy(&desc.Description[..end]),
+        desc.DedicatedVideoMemory as u64,
+    ))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -381,14 +403,16 @@ fn card_clock_watch(clock: &'static CardClock) {
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+fn card_clock_line(frames: f64, ms: f64) -> f64 {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
+        busy
     );
+    busy
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -1779,6 +1803,8 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// with the copy's CPU side byte by byte and put into title memory through
 /// the kernel. A piece is its own bytes of its copy and of title memory,
 /// so eight threads take an eighth of them each.
+/// Relay landings also use the copy pool, grouping whole copies by virtual
+/// overlap and section aliases before merging independent groups in parallel.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
@@ -2963,17 +2989,48 @@ fn relay_hand_back(back: &[Declared]) {
     // that flight's landing, and the merge looks again under the lock.
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-    let (mut now, mut title) = (Vec::new(), Vec::new());
-    for ((shadow, from, to), found) in work.iter().zip(found) {
+    crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64,
+    );
+    let merge = |shadow: &std::sync::Arc<crate::shadow::Shadow>,
+                 from: usize,
+                 to: usize,
+                 found: &[(usize, usize)],
+                 now: &mut Vec<u8>,
+                 title: &mut Vec<u8>| {
         let mut written = 0;
-        for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+        for &(at, n) in found {
+            written += shadow.relay_merge(at, n, now, title);
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::compared(*from, to - from, written);
+        crate::copystat::compared(from, to - from, written);
         let _ = (from, to);
+    };
+    if wide_merge() && work.len() >= 8 {
+        let groups =
+            crate::shadow::relay_groups(&work.iter().map(|w| w.0.clone()).collect::<Vec<_>>());
+        let mut owned: Vec<_> = work.into_iter().zip(found).map(Some).collect();
+        let jobs = groups
+            .into_iter()
+            .map(|group| {
+                let mine: Vec<_> = group
+                    .into_iter()
+                    .map(|i| owned[i].take().unwrap())
+                    .collect();
+                Box::new(move || {
+                    let (mut now, mut title) = (Vec::new(), Vec::new());
+                    for ((shadow, from, to), found) in mine {
+                        merge(&shadow, from, to, &found, &mut now, &mut title);
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+    } else {
+        let (mut now, mut title) = (Vec::new(), Vec::new());
+        for ((shadow, from, to), found) in work.iter().zip(found) {
+            merge(shadow, *from, *to, &found, &mut now, &mut title);
+        }
     }
 }
 
@@ -4207,15 +4264,56 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+        let bytes = pieces.iter().map(|p| (p.2 - p.1) as u64).sum::<u64>();
+        let merge = |pieces: &[Piece]| {
+            let mut title = Vec::new();
+        let mut written = 0;
+        for (shadow, lo, hi, at, after) in pieces {
+                // SAFETY: fetched slots are retained until all jobs finish.
+                let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
             written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
-        }
+            }
+            written
+        };
+        let written = if wide_merge() && pieces.len() >= 8 {
+            let mut indices = std::collections::HashMap::new();
+            let mut shadows = Vec::new();
+            for piece in &pieces {
+                indices
+                    .entry(Arc::as_ptr(&piece.0) as usize)
+                    .or_insert_with(|| {
+                        shadows.push(piece.0.clone());
+                        shadows.len() - 1
+                    });
+            }
+            let groups = crate::shadow::relay_groups(&shadows);
+            let mut group_of = vec![0; shadows.len()];
+            for (group, indices) in groups.iter().enumerate() {
+                for &i in indices {
+                    group_of[i] = group;
+                }
+            }
+            let mut batches: Vec<Vec<Piece>> = (0..groups.len()).map(|_| Vec::new()).collect();
+            // Preserve flight and piece order within every conflicting group.
+            for piece in &pieces {
+                let index = indices[&(Arc::as_ptr(&piece.0) as usize)];
+                batches[group_of[index]].push(piece.clone());
+            }
+            let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let jobs = batches
+                .into_iter()
+                .map(|batch| {
+                    let total = total.clone();
+                    Box::new(move || {
+                        total.fetch_add(merge(&batch), Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            total.load(Ordering::Relaxed)
+        } else {
+            merge(&pieces)
+        };
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -6582,10 +6680,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    // (No `VirtualQuery`-then-memcpy fast path: the title can decommit or
-    // remap the range between the question and the copy, and a plain copy
-    // then faults; one did, reading a page reserved but never committed.
-    // The kernel copy below fails cleanly instead.)
+    // A kernel copy bounds faults if the title unmaps the range concurrently.
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0usize;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
@@ -6844,6 +6939,7 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        crate::frametime::tick();
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -6882,10 +6978,15 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
-        card_clock_line(frames, ms);
+        let gpu_pct = card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
+        let mut card_passes = 0.0;
+        let mut card_compares = 0.0;
+        let mut texture_refresh_ms = 0.0;
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            card_passes += passes;
+            card_compares += compares;
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
@@ -6896,7 +6997,10 @@ impl Meter {
         }
         {
             let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+                [0, 1, 2, 3].map(|i| {
+                crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+            });
+            texture_refresh_ms += all;
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
@@ -6938,6 +7042,48 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
+        // buckets above and the worst/mean frame measured at each present.
+        let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+        let (ram_mb, cpu_pct) = crate::frametime::process_usage();
+        crate::frametime::record(&crate::frametime::Row {
+            frame: crate::queue::presented(),
+            frames,
+            fps,
+            ms,
+            frame_ms_max,
+            frame_ms_avg,
+            cpu_prepare_ms: cpu,
+            gpu_ms: gpu,
+            gpu_pct,
+            copies_ms: copy_ms,
+            copies_mb: copy_mb,
+            textures_ms: texture_ms,
+            textures_mb: texture_mb,
+            copyback_ms: back_ms,
+            copyback_mb: back_mb,
+            draws,
+            dropped,
+            making: crate::pipeline::making() as f64,
+            indirect,
+            heap_passes: picked,
+            heap_ms: picked_ms,
+            texture_refresh_ms,
+            card_passes,
+            card_compares,
+            card_sent_mb: card[0] as f64 / frames / 1e6,
+            card_ranges: card[1] as f64 / frames,
+            card_pieces: card[2] as f64 / frames,
+            card_fetched: card[3] as f64 / frames,
+            card_fetched_mb: card[4] as f64 / frames / 1e6,
+            card_waits: card[5] as f64 / frames,
+            card_wait_ms: card[6] as f64 / frames / 1e3,
+            twins_into_depth: twin_to_depth,
+            twins_into_colour: twin_to_colour,
+            depth_planes: planes,
+            ram_mb,
+            cpu_pct,
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(

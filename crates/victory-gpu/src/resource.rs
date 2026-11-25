@@ -246,20 +246,24 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
+/// R9G9B9E5 (67) also lacks render-target/UAV support on PC GPUs. Use
+/// RGBA16_FLOAT (10) for targets: its range covers shared-exponent RGB,
+/// and float sampling and shader outputs preserve the colour channels.
+/// This does not change read-only packed textures or decode their bytes.
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, replacement)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +283,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, replacement, "the host does not render to this format: a supported format stands in");
                 }
                 refused
             })
@@ -1632,6 +1636,13 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+#[cfg(windows)]
+pub(crate) fn owns(this: This) -> bool {
+    let mut bytes = [0; 8];
+    crate::host::read_into(this.cast(), &mut bytes)
+        && usize::from_ne_bytes(bytes) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -2381,6 +2392,46 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_exponent_targets_use_a_supported_host_format() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let format = target_format(67);
+        // Read-only packed RGB remains packed, for title-memory uploads.
+        let sampled = host_texture(&texture(4, 4, 67, 1), 0, std::ptr::null()).unwrap();
+        assert_eq!(unsafe { sampled.GetDesc() }.Format.0, 67);
+        for flags in [1, 4, 5] {
+            let desc = ResourceDesc {
+                flags,
+                ..texture(4, 4, 67, 1)
+            };
+            let target = host_texture(&desc, 0, std::ptr::null()).unwrap();
+            assert_eq!(unsafe { target.GetDesc() }.Format.0 as u32, format);
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: the query fills our correctly sized structure.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut support).cast(),
+                        size_of_val(&support) as u32,
+                    )
+                    .unwrap();
+            }
+            let required = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+                | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+            assert_eq!(support.Support1.0 & required, required);
+        }
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     fn heap(size: u64) -> This {

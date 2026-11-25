@@ -367,6 +367,92 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
 }
 
+/// Groups ranges that must retain their merge order. Both virtual overlap
+/// and distinct views of the same section bytes count as a conflict.
+pub(crate) fn merge_groups(ranges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let v = views();
+    let mut spans = Vec::new();
+    for (i, &(start, end)) in ranges.iter().enumerate() {
+        spans.push(((false, 0), start as u64, end as u64, i));
+        let before = v.views.range(..=start).next_back();
+        let after = v.views.range(start.saturating_add(1)..end);
+        for (&base, &(len, section, offset)) in before.into_iter().chain(after) {
+            let lo = start.max(base);
+            let hi = end.min(base.saturating_add(len));
+            if lo < hi {
+                spans.push((
+                    (true, section),
+                    offset + (lo - base) as u64,
+                    offset + (hi - base) as u64,
+                    i,
+                ));
+            }
+        }
+    }
+    overlap_groups(ranges.len(), spans)
+}
+
+fn overlap_groups(
+    count: usize,
+    mut spans: Vec<((bool, usize), u64, u64, usize)>,
+) -> Vec<Vec<usize>> {
+    fn root(parents: &mut [usize], mut i: usize) -> usize {
+        while parents[i] != i {
+            parents[i] = parents[parents[i]];
+            i = parents[i];
+        }
+        i
+    }
+    let mut parents: Vec<_> = (0..count).collect();
+    spans.sort_unstable_by_key(|&(space, start, end, i)| (space, start, end, i));
+    let mut previous: Option<((bool, usize), u64, usize)> = None;
+    for (space, start, end, i) in spans {
+        if start >= end {
+            continue;
+        }
+        if let Some((old_space, old_end, old_i)) = previous
+            && space == old_space
+            && start < old_end
+        {
+            let a = root(&mut parents, i);
+            let b = root(&mut parents, old_i);
+            parents[a] = b;
+            previous = Some((space, end.max(old_end), old_i));
+        } else {
+            previous = Some((space, end, i));
+        }
+    }
+    let mut groups = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for i in 0..count {
+        groups.entry(root(&mut parents, i)).or_default().push(i);
+    }
+    groups.into_values().collect()
+}
+
+#[cfg(test)]
+mod merge_group_tests {
+    use super::overlap_groups;
+
+    #[test]
+    fn transitive_aliases_keep_original_order_and_adjacent_ranges_can_run_together() {
+        let mut groups = overlap_groups(
+            5,
+            vec![
+                ((false, 0), 0, 100, 0),
+                ((false, 0), 100, 200, 1),
+                ((false, 0), 500, 600, 2),
+                ((true, 7), 0, 100, 0),
+                ((true, 7), 50, 150, 2),
+                ((true, 8), 0, 100, 2),
+                ((true, 8), 0, 100, 3),
+                ((true, 9), 0, 100, 4),
+            ],
+        );
+        groups.sort();
+        assert_eq!(groups, vec![vec![0, 2, 3], vec![1], vec![4]]);
+    }
+}
+
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).

@@ -2250,6 +2250,10 @@ impl<'a> Lower<'a> {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
                 };
+                let g = if super::mesh_fallback::enabled() {
+                    let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                    self.s.m.bin(self.s.entry, Bin::Add, g, base)
+                } else { g };
                 let n = self.s.m.i32(self.x.mesh_stride);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Mul, g, n));
             }
@@ -2448,6 +2452,12 @@ impl<'a> Lower<'a> {
         };
         if index > 1 {
             return Val::Missing("pull-model barycentrics");
+        }
+        if super::bary_fallback::enabled() {
+            let id = super::bary_fallback::input(&mut self.s, SigElement {
+                name:"VICTORY_BARY".into(), index:u32::from(mode), kind:0, comp:9, interp:mode,
+                row:None,col:0,cols:3,usage:0,half:false });
+            return self.load_any_input(id, index + 1);
         }
         // One element per interpolation mode (the console's own, if its
         // signature declares one): DXIL allows two.
@@ -9044,6 +9054,13 @@ impl<'a> Lower<'a> {
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        if super::bary_fallback::enabled() {
+            let mut e = self.s.inputs[id].clone();
+            e.name = "VICTORY_VERTEX".into(); e.index = id as u32 * 3 + u32::from(k); e.kind = 0; e.interp = 1;
+            let input = super::bary_fallback::input(&mut self.s, e);
+            let Val::I32(x) = self.load_any_input(input, col) else { unreachable!() };
+            return self.as_float(x);
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;

@@ -45,6 +45,10 @@ impl HleResolver {
 
 impl ImportResolver for HleResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        #[cfg(windows)]
+        if let Some(address) = modules::fidelityfx::resolve(dll, &symbol.to_string()) {
+            return Resolution::Found { address, provenance: Provenance::Hle };
+        }
         // Ordinal imports look up `#n`.
         if let Some(address) = registry::lookup(dll, &symbol.to_string()) {
             return Resolution::Found {

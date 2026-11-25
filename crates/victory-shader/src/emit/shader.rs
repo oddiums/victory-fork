@@ -249,6 +249,11 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        if super::mesh_fallback::enabled() && self.mesh.is_some()
+            && matches!(opcode, 168 | 169 | 171 | 172)
+        {
+            return super::mesh_fallback::export(self, block, opcode, args);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -450,6 +455,15 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        super::mesh_fallback::finish(&mut self);
+        if self.pixel && super::bary_fallback::enabled() {
+            let mut row = self.inputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+            for e in self.inputs.iter_mut().filter(|e| e.kind == 28) {
+                e.kind = 0; e.name = "VICTORY_BARY".into(); e.index += 32;
+                e.row = Some(row); e.col = 0; row += 1;
+                if e.interp == 0 { e.interp = 2; }
+            }
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a

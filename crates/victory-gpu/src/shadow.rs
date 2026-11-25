@@ -1122,7 +1122,14 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = copy_worker_count(
+            std::thread::available_parallelism().ok().map(|n| n.get()),
+            std::env::var("VICTORY_COPY_WORKERS").ok().as_deref(),
+        );
+        tracing::info!(
+            workers = n,
+            "copy, compare and detile workers (VICTORY_COPY_WORKERS)"
+        );
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1142,6 +1149,13 @@ fn workers() -> &'static Workers {
         }
     });
     workers
+}
+
+fn copy_worker_count(logical: Option<usize>, setting: Option<&str>) -> usize {
+    setting
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 32))
+        .unwrap_or_else(|| logical.map_or(4, |n| n / 4).clamp(2, 6))
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
@@ -1260,6 +1274,15 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
         })
         .collect();
     find_pieces(scans)
+}
+
+/// Whole-copy conflicts also serialize access to each copy's snapshot.
+pub(crate) fn relay_groups(shadows: &[Arc<Shadow>]) -> Vec<Vec<usize>> {
+    let ranges: Vec<_> = shadows
+        .iter()
+        .map(|s| (s.start as usize, s.start.saturating_add(s.len) as usize))
+        .collect();
+    crate::inplace::merge_groups(&ranges)
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's

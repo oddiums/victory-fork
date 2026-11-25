@@ -26,6 +26,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Published only after a host descriptor and its retained resource
+    /// are installed. Unchanged lookups need no heap-wide writer lock.
+    published: Vec<std::sync::atomic::AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -769,6 +772,9 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            published: (0..count)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, taken)),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
@@ -1210,15 +1216,22 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
+        if let Some(key) = self.published.get(index as usize) {
+            key.store(0, std::sync::atomic::Ordering::Release);
+        }
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
+        if self.sampler {
+            null_sampler(self.cpu(index));
+        } else {
+            match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
+            }
         }
         self.keep(index, None);
     }
@@ -1600,12 +1613,22 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        if tag == VIEW_TAG && key != 0 {
+            let ready = &self.published[index as usize];
+            if ready.load(std::sync::atomic::Ordering::Acquire) == key
+                && let Some(view) = view_at(i, generation)
+                && ready.load(std::sync::atomic::Ordering::Acquire) == key
+            {
+                return Some(view);
+            }
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                self.published[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 made[index as usize] = 0;
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
@@ -1616,6 +1639,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            self.published[index as usize].store(0, std::sync::atomic::Ordering::Release);
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -1658,6 +1682,8 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            self.published[index as usize]
+                .store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
     }
@@ -2676,6 +2702,52 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_descriptor_reads_do_not_wait_for_the_heap_writer() {
+        let Some(heap) = HostHeap::new(true, 4) else {
+            return;
+        };
+        let desc = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+            MaxAnisotropy: 1,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        // SAFETY: the sampler description is thirteen 32-bit words.
+        let words: [u32; 13] = unsafe { std::mem::transmute_copy(&desc) };
+        let mut slot = [0u64; 4];
+        let address = slot.as_mut_ptr() as u64;
+        super::super::record(address, View::Sampler(words));
+        assert_eq!(heap.mirror(0, address, false), Some(View::Sampler(words)));
+        let hit = std::thread::scope(|scope| {
+            let writer = heap.made.lock().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let heap_ref = &heap;
+            let reader = scope.spawn(move || tx.send(heap_ref.mirror(0, address, false)).unwrap());
+            let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+            drop(writer);
+            reader.join().unwrap();
+            result
+        });
+        assert_eq!(hit.unwrap(), Some(View::Sampler(words)));
+        {
+            let mut made = heap.made.lock().unwrap();
+            heap.unmake(&mut made, 0);
+        }
+        assert_eq!(
+            heap.published[0].load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        let mut changed = words;
+        changed[0] = D3D12_FILTER_MIN_MAG_MIP_LINEAR.0 as u32;
+        super::super::record(address, View::Sampler(changed));
+        assert_eq!(heap.mirror(0, address, false), Some(View::Sampler(changed)));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

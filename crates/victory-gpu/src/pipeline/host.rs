@@ -340,6 +340,7 @@ impl Stage {
 }
 
 pub(crate) struct HostPipeline {
+    pub(crate) fallback: Option<MeshFallback>,
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
@@ -363,6 +364,12 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+pub(crate) struct MeshFallback {
+    pub(crate) compute: Box<HostPipeline>,
+    pub(crate) layout: victory_shader::emit::MeshLayout,
+    pub(crate) compact: bool,
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -378,6 +385,12 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        if shaders.iter().any(|s| s.stage == "pixel") && !native_barycentrics() {
+            if let Some((i, pixel)) = shaders.iter().enumerate().find_map(|(i,s)| (s.stage == "pixel").then(|| s.bary_fallback().map(|p| (i,p))).flatten()) {
+                let mut replacements = shaders.to_vec(); replacements[i] = pixel;
+                return Self::new(&replacements, g);
+            }
+        }
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -409,8 +422,28 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+        if let Some(mesh) = mesh
+            && (!host()?.mesh_shaders() || !native_barycentrics() || std::env::var_os("VICTORY_MESH_FALLBACK").is_some_and(|v| v == "1"))
+        {
+            let fallback = mesh.mesh_fallback()?;
+            let original = mesh.translated()?;
+            let cs = Shader::replacement("compute", fallback.compute.clone(), original.used.clone(), original.stores);
+            let pixel = find("pixel").and_then(|ps| ps.translated());
+            // Compact opaque triangles only: preserve ordering for blended
+            // pipelines by retaining the original expanded draw there.
+            let compact = std::env::var("VICTORY_MESH_COMPACT").as_deref() != Ok("0")
+                && g.is_some_and(|g| !g.blend.RenderTarget.iter().any(|b| b.BlendEnable.as_bool()));
+            let make_vertex = if compact { victory_shader::emit::mesh_fallback_vertex_compact } else { victory_shader::emit::mesh_fallback_vertex };
+            let vertex = make_vertex(&fallback.layout, pixel.map(|p| &p.host.dxil[..])).ok()?;
+            let vs = Shader::replacement("vertex", vertex, vec![], false);
+            let compute = Self::new(&[cs], None)?;
+            let mut graphics = vec![vs];
+            graphics.extend(find("pixel").cloned());
+            let mut pipeline = Self::new(&graphics, g)?;
+            pipeline.mesh = true;
+            pipeline.fallback = Some(MeshFallback { compute: Box::new(compute), layout: fallback.layout.clone(), compact });
+            tracing::info!(?shaders, compact, "mesh pipeline emulated with compute and vertex shaders");
+            return Some(pipeline);
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -471,9 +504,11 @@ impl HostPipeline {
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
                     let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS
+                        slot == victory_shader::emit::SLOT_FAULTS || slot == victory_shader::emit::SLOT_MESH_OUTPUT
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
+                            || slot == victory_shader::emit::SLOT_MESH_OUTPUT
+                            || slot == victory_shader::emit::SLOT_MESH_TRIANGLES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
@@ -585,6 +620,7 @@ impl HostPipeline {
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
+                fallback: None,
                 compute: true,
                 mesh: false,
                 pso,
@@ -628,6 +664,7 @@ impl HostPipeline {
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
+                fallback: None,
                 compute: false,
                 mesh: true,
                 pso,
@@ -646,6 +683,12 @@ impl HostPipeline {
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
+        if g.topology.0 != RECTANGLES {
+            if let Some(ps) = stages.get(1).and_then(|(s,_)| s.translated()) {
+                let vs = &stages[0].0.translated()?.host.dxil;
+                rect_gs = victory_shader::emit::barycentric_gs(vs, &ps.host.dxil).ok().flatten();
+            }
+        }
         if g.topology.0 == RECTANGLES {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
@@ -744,6 +787,7 @@ impl HostPipeline {
             "host graphics state"
         );
         Some(HostPipeline {
+            fallback: None,
             compute: false,
             mesh: false,
             pso,
@@ -752,7 +796,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
-            rects: rect_gs.is_some(),
+            rects: rect_gs.is_some() && g.topology.0 == RECTANGLES,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
@@ -782,6 +826,19 @@ impl HostPipeline {
             },
         })
     }
+}
+
+fn native_barycentrics() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let supported = (unsafe { host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3,
+            (&raw mut options).cast(), size_of_val(&options) as u32).is_ok() })
+            && options.BarycentricsSupported.as_bool();
+        tracing::info!(supported, "host barycentric support");
+        supported
+    })
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state

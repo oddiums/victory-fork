@@ -67,6 +67,8 @@ developer or publisher.
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+- The frametime CSV dumper and pipeline worker controls are adapted from
+  [skornuta/victory-fork](https://github.com/skornuta/victory-fork), under GPL-3.0.
 
 ## Status of this fork (2026-11-25)
 
@@ -176,8 +178,24 @@ What each part does today and what it still needs:
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
+shader model 6.6, Rust (pinned in
 `rust-toolchain.toml`).
+
+GPUs without mesh shaders use an experimental compute-and-vertex fallback
+automatically. Mesh exports stay on the GPU in a shared 128 MiB buffer;
+larger indirect dispatches run in pages. GPUs without barycentric inputs
+also get a geometry-stage fallback. These paths target older cards such as
+the RX 5700 XT; they do not provide ray tracing or make the fork playable.
+`VICTORY_MESH_FALLBACK=1` forces mesh emulation on a mesh-capable GPU for testing.
+
+On GPUs without mesh shaders, FidelityFX upscale dispatches also fall back
+to filtered spatial scaling. This avoids empty Series S output when the
+title's upscaler cannot run, but loses temporal reconstruction and sharpening.
+`VICTORY_FSR_FALLBACK=1` forces this path; `0` disables it. Other FidelityFX
+operations still use the title's DLL.
+
+For an optimized Series S launcher, configurable copy/pipeline workers,
+and CSV frametime profiling, see [the performance guide](docs/performance.md).
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If

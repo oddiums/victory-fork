@@ -249,6 +249,93 @@ impl Drop for State {
 }
 
 impl State {
+    /// Runs a mesh producer as compute and expands its indexed triangles
+    /// through the fallback vertex shader. Pages are reused only after a
+    /// UAV barrier; the GPU generates both indirect counts for every page.
+    fn emulate_mesh(
+        &mut self, list: &HostList, p: &HostPipeline,
+        indirect: Option<((&ID3D12Resource, u64), Option<(&ID3D12Resource, u64)>, u32)>,
+        groups: u32,
+    ) -> bool {
+        let Some(f) = &p.fallback else { return false };
+        let Some((output, arguments)) = crate::mesh_fallback::buffers(list) else { return false };
+        let capacity = (crate::mesh_fallback::OUTPUT_BYTES / u64::from(f.layout.group_stride)).min(65535) as u32;
+        if capacity == 0 { return false; }
+        let chunks = if let Some((source, counter, record)) = indirect {
+            let Some(n) = crate::mesh_fallback::arguments(list, source, counter, &arguments, capacity, f.layout.max_primitives, record) else { return false };
+            self.host_pipeline = 0; self.host_roots[1] = 0;
+            n
+        } else { groups.div_ceil(capacity) };
+        let _arguments = indirect.map(|_| crate::mesh_fallback::ArgumentUse(list, &arguments));
+        if !self.prepare_for(list, false, true) { return false; }
+        // The compute producer reads the title's GRAPHICS root arguments.
+        // Host compute bindings have separate state, so retain both sets.
+        std::mem::swap(&mut self.graphics, &mut self.compute);
+        let ready = self.bind(list, &f.compute, true);
+        std::mem::swap(&mut self.graphics, &mut self.compute);
+        if !ready { return false; }
+        let slot = victory_shader::emit::SLOT_MESH_OUTPUT;
+        let param = |p: &HostPipeline| p.stages.iter().flat_map(|s| &s.root_uavs).find(|s| s.0 == slot).map(|s| s.1);
+        let vs_output = p.stages.iter().flat_map(|s| &s.root_srvs).find(|s| s.0 == slot).map(|s| s.1);
+        let (Some(cs_output), Some(vs_output)) = (param(&f.compute), vs_output) else { return false };
+        let compact = if f.compact {
+            let Some(pass) = crate::mesh_fallback::compactor() else { return false };
+            let Some(param) = p.stages.iter().flat_map(|s| &s.root_srvs)
+                .find(|s| s.0 == victory_shader::emit::SLOT_MESH_TRIANGLES).map(|s| s.1) else { return false };
+            let Some(draw) = host_signature(0,16) else { return false };
+            Some((pass,param,draw))
+        } else { None };
+        let base = group_base(&f.compute);
+        let signatures = if indirect.is_some() {
+            match (host_signature(2, 32), host_signature(0, 32)) {
+                (Some(cs), Some(vs)) => Some((cs, vs)), _ => return false,
+            }
+        } else { None };
+        let l = &list.list;
+        unsafe {
+            let address = output.GetGPUVirtualAddress();
+            l.SetComputeRootUnorderedAccessView(cs_output, address);
+            l.SetGraphicsRootShaderResourceView(vs_output, address);
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            for chunk in 0..chunks {
+                if compact.is_some() && chunk != 0 {
+                    std::mem::swap(&mut self.graphics,&mut self.compute);
+                    let ready = self.bind(list,&f.compute,true);
+                    std::mem::swap(&mut self.graphics,&mut self.compute);
+                    if !ready { return false; }
+                    l.SetComputeRootUnorderedAccessView(cs_output,address);
+                }
+                crate::mesh_fallback::barrier(list, &output);
+                l.SetPipelineState(&f.compute.pso);
+                if let Some((param, dword)) = base { l.SetComputeRoot32BitConstant(param, chunk * capacity, dword); }
+                let n = groups.saturating_sub(chunk * capacity).min(capacity);
+                if let Some((cs, _)) = &signatures {
+                    l.ExecuteIndirect(cs, 1, &arguments, u64::from(chunk) * 32, None, 0);
+                } else { l.Dispatch(n, 1, 1); }
+                crate::mesh_fallback::barrier(list, &output);
+                l.ResourceBarrier(&[crate::host::transition(&output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                if let Some((pass,param,draw)) = &compact {
+                    let indirect = signatures.as_ref().map(|(cs,_)| (cs,&arguments,u64::from(chunk)*32));
+                    pass.record(list,&output,&f.layout,n,indirect);
+                    self.host_roots[1] = 0; self.host_pipeline = 0;
+                    l.SetGraphicsRootShaderResourceView(*param,pass.triangles.GetGPUVirtualAddress());
+                    l.SetPipelineState(&p.pso);
+                    l.ExecuteIndirect(draw,1,&pass.draw,0,None,0);
+                    pass.done(list);
+                } else {
+                    l.SetPipelineState(&p.pso);
+                    if let Some((_, vs)) = &signatures {
+                        l.ExecuteIndirect(vs, 1, &arguments, u64::from(chunk) * 32 + 16, None, 0);
+                    } else { l.DrawInstanced(n * f.layout.max_primitives * 3, 1, 0, 0); }
+                }
+                l.ResourceBarrier(&[crate::host::transition(&output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            }
+        }
+        self.host_pipeline = 0;
+        // Restore the title's primitive topology after the synthetic draw.
+        self.set_topology(list, self.topology);
+        true
+    }
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -1029,6 +1116,7 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && matches!(slot, victory_shader::emit::SLOT_MESH_OUTPUT | victory_shader::emit::SLOT_MESH_TRIANGLES) { continue; }
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
@@ -1107,6 +1195,10 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_MESH_OUTPUT {
+                    // Bound by the mesh emulation draw, never title memory.
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -2006,6 +2098,14 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && p.fallback.is_some()
+        {
+            if mesh_test() != 1 && mesh_kept(self.pipeline) && self.emulate_mesh(list, p, None, x.min(65535)) {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else { DROPPED.fetch_add(1, Ordering::Relaxed); }
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2555,7 +2655,7 @@ impl State {
             None => None,
         };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| host_signature(if kind == MESH && p.fallback.is_some() { DISPATCH } else { kind }, stride))
             .flatten()
         else {
             why("no host signature");
@@ -2564,6 +2664,22 @@ impl State {
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
+        }
+        if kind == MESH && p.fallback.is_some() {
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if let Some((s, at)) = &counter { s.refresh(list, *at, 4); }
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let Some(bounded) = crate::indirect::bound(list, (&args.buffer, args.offset(arguments)), count_arg, (kind, stride, max)) else { return false };
+            self.host_pipeline = 0; self.host_roots[1] = 0;
+            let mut ran = true;
+            for record in 0..max {
+                let source = (&bounded, u64::from(record) * u64::from(stride));
+                ran &= self.emulate_mesh(list, p, Some((source, count_arg, record)), 0);
+            }
+            crate::indirect::done(list, &bounded);
+            if ran { DRAWN.fetch_add(1, Ordering::Relaxed); }
+            return ran;
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no

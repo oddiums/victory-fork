@@ -152,6 +152,16 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     } else {
         module
     };
+    #[cfg(windows)]
+    if (name as usize) >= 0x1_0000 {
+        if let Some(path) = runtime::image_path(module as usize) {
+            if let Some(file) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(address) = super::fidelityfx::resolve(file, &narrow(name)) {
+                    return address as *mut c_void;
+                }
+            }
+        }
+    }
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
